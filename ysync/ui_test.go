@@ -628,6 +628,38 @@ func TestUICachedRemotesDoesNotScanWithoutCacheOnPageLoad(t *testing.T) {
 	}
 }
 
+func TestApplyPlanToRemoteCachePersistsDeletedSubtree(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "remote-cache.json")
+	cfg := Config{BaseURL: "https://webdav.yandex.ru", RemoteRoot: "/", RemoteCachePath: cachePath}
+	s := &uiServer{
+		cfg: cfg,
+		remotes: map[string]RemoteEntry{
+			"docs":       {Path: "docs", IsDir: true},
+			"docs/a.txt": {Path: "docs/a.txt", Size: 1},
+			"keep.txt":   {Path: "keep.txt", Size: 2},
+		},
+		remoteAt: at(10),
+	}
+	s.applyPlanToRemoteCache(emptyState(), []PlanItem{{Action: ActionTrashRemote, Path: "docs"}})
+
+	cache, ok, err := LoadRemoteTreeCache(cachePath, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected persisted remote cache")
+	}
+	if _, ok := cache.Entries["docs"]; ok {
+		t.Fatalf("deleted directory still persisted: %#v", cache.Entries)
+	}
+	if _, ok := cache.Entries["docs/a.txt"]; ok {
+		t.Fatalf("deleted child still persisted: %#v", cache.Entries)
+	}
+	if _, ok := cache.Entries["keep.txt"]; !ok {
+		t.Fatalf("unrelated entry missing: %#v", cache.Entries)
+	}
+}
+
 func TestBuildTreeNodesShowsRootChildren(t *testing.T) {
 	locals := map[string]LocalEntry{
 		"Documents":       {Path: "Documents", IsDir: true},

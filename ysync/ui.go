@@ -557,10 +557,10 @@ func canDisplayCachedRemoteAfterRefreshError(snap uiSnapshot, errMsg string) boo
 
 func (s *uiServer) applyPlanToRemoteCache(state SyncState, plan []PlanItem) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.remotes == nil {
 		s.remotes = map[string]RemoteEntry{}
 	}
+	changed := false
 	for _, item := range plan {
 		rel := cleanRel(item.Path)
 		switch item.Action {
@@ -573,15 +573,25 @@ func (s *uiServer) applyPlanToRemoteCache(state SyncState, plan []PlanItem) {
 					Size:    entry.RemoteSize,
 					ETag:    entry.RemoteETag,
 				}
+				changed = true
 			}
 		case ActionTrashRemote, ActionDeleteRemote:
 			deleteRemoteCacheSubtree(s.remotes, rel)
+			changed = true
 		}
 	}
-	if !s.remoteAt.IsZero() {
+	if s.remoteAt.IsZero() {
+		s.remoteAt = time.Now().UTC()
+	}
+	remotes := cloneRemotes(s.remotes)
+	remoteAt := s.remoteAt
+	s.mu.Unlock()
+	if !changed {
 		return
 	}
-	s.remoteAt = time.Now().UTC()
+	if err := SaveRemoteTreeCache(s.cfg.RemoteCachePath, s.cfg, remoteAt, remotes); err != nil {
+		s.log.Warn("failed to persist remote cache update", "error", err)
+	}
 }
 
 func deleteRemoteCacheSubtree(remotes map[string]RemoteEntry, rel string) {
@@ -756,12 +766,24 @@ func (s *uiServer) runPathAction(ctx context.Context, action Action, rel string)
 	if err != nil {
 		return err
 	}
-	next, err := ExecutePlan(ctx, s.cfg, client, snap.State, []PlanItem{{Action: action, Path: rel, Reason: "user requested from UI"}}, s.log)
+	// For local delete/trash, also perform the corresponding remote action
+	// atomically under the same lock. Relying on the auto-sync cycle to
+	// propagate the deletion is fragile: remote cache metadata drift can
+	// cause remoteDiffers to return true, turning the deletion into a
+	// conflict (localDeleted && remoteChanged).
+	plan := []PlanItem{{Action: action, Path: rel, Reason: "user requested from UI"}}
+	switch action {
+	case ActionTrashLocal:
+		plan = append(plan, PlanItem{Action: ActionTrashRemote, Path: rel, Reason: "paired remote trash for local delete"})
+	case ActionDeleteLocal:
+		plan = append(plan, PlanItem{Action: ActionDeleteRemote, Path: rel, Reason: "paired remote delete for local delete"})
+	}
+	next, err := ExecutePlan(ctx, s.cfg, client, snap.State, plan, s.log)
 	if err == nil {
 		err = SaveStateAtomic(s.cfg.StatePath, next)
 	}
 	if err == nil {
-		s.applyPlanToRemoteCache(next, []PlanItem{{Action: action, Path: rel}})
+		s.applyPlanToRemoteCache(next, plan)
 		s.setSyncStatus(false, string(action)+" completed", false, action == ActionUpload || action == ActionDownload)
 	}
 	return err

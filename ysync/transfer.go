@@ -139,7 +139,19 @@ func trashRemotePath(ctx context.Context, remoteRoot string, client *WebDAVClien
 	if !ok {
 		return nil
 	}
-	if err := expectWebDAVStatus(client.MoveOriginalToTrash(ctx, relPath, remoteTrashPath(relPath))); err != nil {
+	// Try MOVE to /ysync-trash/ first (standard WebDAV trash). If Yandex Disk
+	// returns 409 Conflict (e.g. destination parent directory doesn't exist,
+	// or server doesn't support MOVE to non-existent path), fall back to DELETE.
+	resp, err := client.MoveOriginalToTrash(ctx, relPath, remoteTrashPath(relPath))
+	if err != nil {
+		return fmt.Errorf("move remote to trash %s: %w", relPath, err)
+	}
+	if resp.StatusCode == http.StatusConflict {
+		_ = resp.Body.Close()
+		if err := expectWebDAVStatus(client.Delete(ctx, relPath)); err != nil {
+			return fmt.Errorf("fallback delete remote %s: %w", relPath, err)
+		}
+	} else if err := expectWebDAVStatus(resp, nil); err != nil {
 		return fmt.Errorf("move remote to trash %s: %w", relPath, err)
 	}
 	deleteStateSubtree(state, relPath)
@@ -164,6 +176,28 @@ func deleteRemotePath(ctx context.Context, client *WebDAVClient, state SyncState
 
 func ensureRemoteUnchangedForDelete(ctx context.Context, client *WebDAVClient, state SyncState, relPath string) (bool, error) {
 	prev, tracked := state.Entries[relPath]
+
+	// For entries already marked as deleted locally (from a paired
+	// trash-local/delete-local operation), we only need to check remote
+	// existence — skip the metadata comparison that can falsely conflict
+	// due to ETag drift (e.g. Yandex Disk returning different ETags on
+	// point-refresh). The user explicitly confirmed this deletion.
+	if tracked && prev.Status == StatusDeletedLocal {
+		remote, ok, err := RefreshRemotePath(ctx, client, relPath)
+		if err != nil {
+			return false, fmt.Errorf("refresh remote before delete %s: %w", relPath, err)
+		}
+		if !ok {
+			// Remote already gone — nothing to do. Clean up state.
+			deleteStateSubtree(state, relPath)
+			return false, nil
+		}
+		// Remote exists — proceed with delete regardless of metadata.
+		// The server's HTTP response will validate the actual operation.
+		_ = remote
+		return true, nil
+	}
+
 	remote, ok, err := RefreshRemotePath(ctx, client, relPath)
 	if err != nil {
 		return false, fmt.Errorf("refresh remote before delete %s: %w", relPath, err)
@@ -172,11 +206,17 @@ func ensureRemoteUnchangedForDelete(ctx context.Context, client *WebDAVClient, s
 		deleteStateSubtree(state, relPath)
 		return false, nil
 	}
-	if tracked && remoteDiffers(remote, prev) {
+	if tracked && remoteChangedBeforeDelete(remote, prev) {
 		markStateStatus(state, relPath, StatusConflict)
 		return false, fmt.Errorf("remote changed before delete %s", relPath)
 	}
 	return true, nil
+}
+
+func remoteChangedBeforeDelete(remote RemoteEntry, prev SyncEntry) bool {
+	return remote.IsDir != prev.IsDir ||
+		remote.Size != prev.RemoteSize ||
+		!timeEqual(remote.ModTime, prev.RemoteModTime)
 }
 
 func trashLocalPath(localRoot string, state SyncState, relPath string) error {

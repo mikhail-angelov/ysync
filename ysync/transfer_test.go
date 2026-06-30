@@ -329,6 +329,227 @@ func TestDeleteLocalRemovesNonEmptyDirectoryAndPreservesDirectoryStateEntryForRe
 	}
 }
 
+func TestTrashRemoteFallsBackToDeleteOn409Conflict(t *testing.T) {
+	var gotMethod string
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.Method {
+		case "PROPFIND":
+			body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/a.txt</d:href><d:propstat><d:prop>
+<d:getlastmodified>Thu, 01 Jan 1970 00:00:01 GMT</d:getlastmodified>
+<d:getcontentlength>5</d:getcontentlength><d:getetag>"old"</d:getetag>
+</d:prop></d:propstat></d:response></d:multistatus>`
+			return xmlResponse(http.StatusMultiStatus, body), nil
+		case "MOVE":
+			gotMethod = "MOVE"
+			// Yandex Disk returns 409 Conflict when destination directory doesn't exist
+			return textResponse(http.StatusConflict, "409 Conflict", ""), nil
+		case "DELETE":
+			gotMethod = "DELETE"
+			return textResponse(http.StatusNoContent, "204 No Content", ""), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+			return nil, nil
+		}
+	})}
+	client, err := NewWebDAVClient("https://example.test", "/YSync", "", "", httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := emptyState()
+	state.Entries["a.txt"] = SyncEntry{
+		Path:          "a.txt",
+		RemoteSize:    5,
+		RemoteModTime: at(1),
+		RemoteETag:    "old",
+		Status:        StatusSynced,
+	}
+	cfg := Config{LocalRoot: t.TempDir(), RemoteRoot: "/YSync"}
+	_, err = ExecutePlan(context.Background(), cfg, client, state, []PlanItem{{Action: ActionTrashRemote, Path: "a.txt"}}, Logger{out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != "DELETE" {
+		t.Fatalf("expected DELETE fallback on 409, got %s", gotMethod)
+	}
+}
+
+func TestTrashLocalThenTrashRemoteSucceedsWhenRemoteMetadataDrifted(t *testing.T) {
+	localRoot := t.TempDir()
+	path := filepath.Join(localRoot, "a.txt")
+	if err := os.WriteFile(path, []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var destinations []string
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.Method {
+		case "PROPFIND":
+			// Return a **different** ETag than what's in state, simulating
+			// Yandex Disk metadata drift. Without the fix, this would cause
+			// remoteDiffers to return true and block the remote deletion.
+			body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/a.txt</d:href><d:propstat><d:prop>
+<d:getlastmodified>Thu, 01 Jan 1970 00:00:02 GMT</d:getlastmodified>
+<d:getcontentlength>5</d:getcontentlength><d:getetag>"drifted-etag"</d:getetag>
+</d:prop></d:propstat></d:response></d:multistatus>`
+			return xmlResponse(http.StatusMultiStatus, body), nil
+		case "MOVE":
+			destinations = append(destinations, req.Header.Get("Destination"))
+			// Simulate Yandex Disk 409, expecting fallback to DELETE
+			if strings.Contains(req.Header.Get("Destination"), "ysync-trash") {
+				return textResponse(http.StatusConflict, "409 Conflict", ""), nil
+			}
+			return textResponse(http.StatusCreated, "201 Created", ""), nil
+		case "DELETE":
+			// Fallback DELETE should be called after MOVE 409
+			return textResponse(http.StatusNoContent, "204 No Content", ""), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+			return nil, nil
+		}
+	})}
+	client, err := NewWebDAVClient("https://example.test", "/YSync", "", "", httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := emptyState()
+	state.Entries["a.txt"] = SyncEntry{
+		Path:          "a.txt",
+		LocalSize:     5,
+		LocalModTime:  normalizeTime(info.ModTime()),
+		RemoteSize:    5,
+		RemoteModTime: at(1),
+		RemoteETag:    "old-etag",
+		Status:        StatusSynced,
+	}
+	cfg := Config{LocalRoot: localRoot, RemoteRoot: "/YSync"}
+	plan := []PlanItem{
+		{Action: ActionTrashLocal, Path: "a.txt", Reason: "user requested from UI"},
+		{Action: ActionTrashRemote, Path: "a.txt", Reason: "paired remote trash for local delete"},
+	}
+	next, err := ExecutePlan(context.Background(), cfg, client, state, plan, Logger{out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("file still exists or unexpected stat error: %v", err)
+	}
+	if _, ok := next.Entries["a.txt"]; ok {
+		t.Fatalf("state entry was not removed after paired plan: %#v", next.Entries["a.txt"])
+	}
+}
+
+func TestTrashRemoteAllowsETagOnlyDriftForLocalDeleteSync(t *testing.T) {
+	var gotDelete bool
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.Method {
+		case "PROPFIND":
+			body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/a.txt</d:href><d:propstat><d:prop>
+<d:getlastmodified>Thu, 01 Jan 1970 00:00:01 GMT</d:getlastmodified>
+<d:getcontentlength>5</d:getcontentlength><d:getetag>"drifted"</d:getetag>
+</d:prop></d:propstat></d:response></d:multistatus>`
+			return xmlResponse(http.StatusMultiStatus, body), nil
+		case "MOVE":
+			return textResponse(http.StatusConflict, "409 Conflict", ""), nil
+		case "DELETE":
+			gotDelete = true
+			return textResponse(http.StatusNoContent, "204 No Content", ""), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+			return nil, nil
+		}
+	})}
+	client, err := NewWebDAVClient("https://example.test", "/YSync", "", "", httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := emptyState()
+	state.Entries["a.txt"] = SyncEntry{
+		Path:          "a.txt",
+		RemoteSize:    5,
+		RemoteModTime: at(1),
+		RemoteETag:    "old",
+		Status:        StatusSynced,
+	}
+	cfg := Config{LocalRoot: t.TempDir(), RemoteRoot: "/YSync"}
+	next, err := ExecutePlan(context.Background(), cfg, client, state, []PlanItem{{Action: ActionTrashRemote, Path: "a.txt"}}, Logger{out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gotDelete {
+		t.Fatal("expected DELETE fallback after MOVE conflict")
+	}
+	if _, ok := next.Entries["a.txt"]; ok {
+		t.Fatalf("state entry was not removed after remote delete: %#v", next.Entries["a.txt"])
+	}
+}
+
+func TestDeleteLocalThenDeleteRemoteSucceedsWhenRemoteMetadataDrifted(t *testing.T) {
+	localRoot := t.TempDir()
+	dir := filepath.Join(localRoot, "mydir")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotDeletePath string
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.Method {
+		case "PROPFIND":
+			body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/mydir</d:href><d:propstat><d:prop>
+<d:getlastmodified>Thu, 01 Jan 1970 00:00:02 GMT</d:getlastmodified>
+<d:getcontentlength>0</d:getcontentlength><d:getetag>"drifted"</d:getetag>
+</d:prop></d:propstat></d:response></d:multistatus>`
+			return xmlResponse(http.StatusMultiStatus, body), nil
+		case "DELETE":
+			gotDeletePath = req.URL.Path
+			return textResponse(http.StatusNoContent, "204 No Content", ""), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+			return nil, nil
+		}
+	})}
+	client, err := NewWebDAVClient("https://example.test", "/YSync", "", "", httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := emptyState()
+	state.Entries["mydir"] = SyncEntry{
+		Path:          "mydir",
+		IsDir:         true,
+		LocalModTime:  normalizeTime(dirInfo.ModTime()),
+		RemoteModTime: at(1),
+		RemoteETag:    "old-etag",
+		Status:        StatusSynced,
+	}
+	cfg := Config{LocalRoot: localRoot, RemoteRoot: "/YSync"}
+	plan := []PlanItem{
+		{Action: ActionDeleteLocal, Path: "mydir", Reason: "user requested from UI"},
+		{Action: ActionDeleteRemote, Path: "mydir", Reason: "paired remote delete for local delete"},
+	}
+	next, err := ExecutePlan(context.Background(), cfg, client, state, plan, Logger{out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("directory still exists or unexpected stat error: %v", err)
+	}
+	if !strings.HasSuffix(gotDeletePath, "/mydir") {
+		t.Fatalf("DELETE path = %q, want .../mydir", gotDeletePath)
+	}
+	if _, ok := next.Entries["mydir"]; ok {
+		t.Fatalf("state entry was not removed after paired plan: %#v", next.Entries["mydir"])
+	}
+}
+
 func TestDeleteLocalAllowsUntrackedDirectoryFromUIAction(t *testing.T) {
 	localRoot := t.TempDir()
 	dir := filepath.Join(localRoot, "local-only")
