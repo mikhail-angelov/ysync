@@ -113,6 +113,9 @@ func TestTreeRowShowsStatusIconAndActions(t *testing.T) {
 		`id="entry-node-a-txt"`,
 		`id="row-node-a-txt"`,
 		`finder-status-icon status-remote-only-ignored`,
+		`class="action-menu"`,
+		`title="Actions"`,
+		`class="action-menu-list"`,
 		`class="sync-form"`,
 		`hx-post="/actions/path/download?path=a.txt&amp;return=tree-row"`,
 		`hx-target="#entry-node-a-txt"`,
@@ -277,6 +280,7 @@ func TestTreeConflictFileShowsResolutionActions(t *testing.T) {
 		`>Keep remote</button>`,
 		`hx-post="/actions/path/download?path=conflict.txt&amp;return=tree-row"`,
 		`>Mark synced</button>`,
+		`class="action-menu-list"`,
 		`hx-target="#entry-node-conflict-txt"`,
 	} {
 		if !strings.Contains(html, want) {
@@ -408,6 +412,44 @@ func TestAutoSyncRemoteRefreshFallbackIsSkippedNotFatal(t *testing.T) {
 	}
 	if canDisplayCachedRemoteAfterRefreshError(uiSnapshot{HasRemote: true}, "") {
 		t.Fatal("empty error should not be treated as fallback warning")
+	}
+}
+
+func TestPreparePathActionStateSeedsConflictMetadataForUpload(t *testing.T) {
+	local := LocalEntry{Path: "notes/sec.txt", Size: 5, ModTime: at(1)}
+	remote := RemoteEntry{Path: "notes/sec.txt", Size: 9, ModTime: at(2), ETag: "remote"}
+	snap := uiSnapshot{
+		State:   emptyState(),
+		Locals:  map[string]LocalEntry{"notes/sec.txt": local},
+		Remotes: map[string]RemoteEntry{"notes/sec.txt": remote},
+		Plan:    []PlanItem{{Action: ActionConflict, Path: "notes/sec.txt"}},
+	}
+
+	state := preparePathActionState(ActionUpload, "notes/sec.txt", snap)
+
+	entry, ok := state.Entries["notes/sec.txt"]
+	if !ok {
+		t.Fatal("expected seeded state entry")
+	}
+	if entry.Status != StatusConflict || entry.LocalSize != local.Size || entry.RemoteSize != remote.Size || entry.RemoteETag != remote.ETag {
+		t.Fatalf("seeded entry = %#v", entry)
+	}
+	if _, ok := snap.State.Entries["notes/sec.txt"]; ok {
+		t.Fatal("preparePathActionState should not mutate snapshot state entries")
+	}
+}
+
+func TestPreparePathActionStateLeavesOrdinaryUploadUntracked(t *testing.T) {
+	snap := uiSnapshot{
+		State:   emptyState(),
+		Locals:  map[string]LocalEntry{"notes/sec.txt": {Path: "notes/sec.txt", Size: 5}},
+		Remotes: map[string]RemoteEntry{},
+		Plan:    []PlanItem{{Action: ActionUpload, Path: "notes/sec.txt"}},
+	}
+
+	state := preparePathActionState(ActionUpload, "notes/sec.txt", snap)
+	if len(state.Entries) != 0 {
+		t.Fatalf("state entries = %#v, want empty", state.Entries)
 	}
 }
 

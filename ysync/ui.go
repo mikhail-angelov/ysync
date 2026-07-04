@@ -525,15 +525,19 @@ func (s *uiServer) runAutoSync(ctx context.Context, rel string) error {
 	if err != nil {
 		return err
 	}
-	next, err := ExecutePlan(ctx, s.cfg, client, snap.State, plan, s.log)
-	if err == nil {
-		err = SaveStateAtomic(s.cfg.StatePath, next)
+	next, executed, err := ExecutePlanDetailed(ctx, s.cfg, client, snap.State, plan, s.log)
+	if saveErr := SaveStateAtomic(s.cfg.StatePath, next); saveErr != nil {
+		if err == nil {
+			err = saveErr
+		} else {
+			s.log.Error("failed to save partial sync state", "error", saveErr)
+		}
 	}
+	s.applyPlanToRemoteCache(next, executed)
 	if err != nil {
 		return err
 	}
-	s.applyPlanToRemoteCache(next, plan)
-	msg := fmt.Sprintf("executed %d operations", len(plan))
+	msg := fmt.Sprintf("executed %d operations", len(executed))
 	s.addOp("auto-sync", rel, msg, false)
 	s.setSyncStatus(false, msg, false, true)
 	return nil
@@ -771,6 +775,7 @@ func (s *uiServer) runPathAction(ctx context.Context, action Action, rel string)
 	// propagate the deletion is fragile: remote cache metadata drift can
 	// cause remoteDiffers to return true, turning the deletion into a
 	// conflict (localDeleted && remoteChanged).
+	state := preparePathActionState(action, rel, snap)
 	plan := []PlanItem{{Action: action, Path: rel, Reason: "user requested from UI"}}
 	switch action {
 	case ActionTrashLocal:
@@ -778,7 +783,7 @@ func (s *uiServer) runPathAction(ctx context.Context, action Action, rel string)
 	case ActionDeleteLocal:
 		plan = append(plan, PlanItem{Action: ActionDeleteRemote, Path: rel, Reason: "paired remote delete for local delete"})
 	}
-	next, err := ExecutePlan(ctx, s.cfg, client, snap.State, plan, s.log)
+	next, err := ExecutePlan(ctx, s.cfg, client, state, plan, s.log)
 	if err == nil {
 		err = SaveStateAtomic(s.cfg.StatePath, next)
 	}
@@ -787,6 +792,41 @@ func (s *uiServer) runPathAction(ctx context.Context, action Action, rel string)
 		s.setSyncStatus(false, string(action)+" completed", false, action == ActionUpload || action == ActionDownload)
 	}
 	return err
+}
+
+func preparePathActionState(action Action, rel string, snap uiSnapshot) SyncState {
+	if action != ActionUpload && action != ActionDownload {
+		return snap.State
+	}
+	if !pathHasConflictPlan(snap.Plan, rel) && snap.State.Entries[rel].Status != StatusConflict {
+		return snap.State
+	}
+	local, hasLocal := snap.Locals[rel]
+	remote, hasRemote := snap.Remotes[rel]
+	if !hasLocal || !hasRemote {
+		return snap.State
+	}
+	state := snap.State
+	state.Entries = cloneStateEntries(snap.State.Entries)
+	state.Entries[rel] = EntryFromMetadata(rel, local, remote, StatusConflict)
+	return state
+}
+
+func pathHasConflictPlan(plan []PlanItem, rel string) bool {
+	for _, item := range plan {
+		if item.Path == rel && item.Action == ActionConflict {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneStateEntries(entries map[string]SyncEntry) map[string]SyncEntry {
+	cloned := make(map[string]SyncEntry, len(entries))
+	for path, entry := range entries {
+		cloned[path] = entry
+	}
+	return cloned
 }
 
 func (s *uiServer) markSynced(rel string, snap uiSnapshot) error {
@@ -1426,7 +1466,7 @@ const uiTemplates = `
     .finder-search input[type="search"] { flex:1; border-radius:7px; }
     .finder-check { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; color:#3d4554; }
     .finder-list { display:block; }
-    .finder-head, .finder-row { display:grid; grid-template-columns:minmax(260px,1fr) minmax(86px,110px) minmax(150px,180px) minmax(170px,210px); }
+    .finder-head, .finder-row { display:grid; grid-template-columns:minmax(260px,1fr) minmax(86px,110px) minmax(150px,180px) minmax(64px,82px); }
     .finder-head span { background:#f6f7f9; color:#687084; font-size:12px; font-weight:600; padding:7px 10px; border-bottom:1px solid var(--line); }
     .finder-cell { height:34px; padding:6px 10px; border-bottom:1px solid #edf0f5; display:flex; align-items:center; min-width:0; overflow:hidden; white-space:nowrap; }
     .finder-row:hover .finder-cell { background:#eef5ff; }
@@ -1439,8 +1479,17 @@ const uiTemplates = `
     .finder-name span:last-child { min-width:0; overflow:hidden; }
     .finder-path { display:none; }
     .finder-source { color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; }
-    .finder-actions { justify-content:flex-end; gap:5px; }
-    .finder-actions button { min-height:26px; padding:3px 7px; }
+    .finder-actions { justify-content:flex-end; overflow:visible; }
+    .action-menu { position:relative; display:inline-flex; justify-content:flex-end; }
+    .action-menu summary { list-style:none; width:28px; height:26px; border:1px solid var(--line); border-radius:6px; background:#fff; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; color:#3d4554; font-size:18px; line-height:1; }
+    .action-menu summary::-webkit-details-marker { display:none; }
+    .action-menu summary:hover, .action-menu[open] summary { background:#f0f7ff; border-color:#b8c8e8; }
+    .action-menu-list { position:absolute; right:0; top:30px; min-width:150px; display:flex; flex-direction:column; gap:2px; padding:5px; border:1px solid var(--line); border-radius:8px; background:#fff; box-shadow:0 12px 32px rgba(20,26,38,.16); z-index:4; }
+    .action-menu-list form { display:contents; }
+    .action-menu-list button { width:100%; min-height:30px; padding:5px 8px; justify-content:flex-start; border-color:transparent; background:#fff; }
+    .action-menu-list button:hover { background:#f4f7fb; }
+    .action-menu-list button.danger { color:var(--bad); background:#fff; border-color:transparent; }
+    .action-menu-list button.danger:hover { background:#fff5f5; }
     .finder-child-slot { display:block; }
     .finder-empty { padding:20px; color:var(--muted); }
     .pill { display:inline-flex; gap:5px; align-items:center; border:1px solid var(--line); border-radius:999px; padding:2px 7px; white-space:nowrap; background:#fff; max-width:100%; overflow:hidden; text-overflow:ellipsis; }
@@ -1527,14 +1576,19 @@ const uiTemplates = `
   <div class="finder-cell">{{if .LocalExists}}{{formatSize .LocalSize}}{{else}}{{if .RemoteExists}}{{formatSize .RemoteSize}}{{else}}-{{end}}{{end}}</div>
   <div class="finder-cell">{{if .LocalExists}}{{formatTime .LocalModTime}}{{else}}{{formatTime .RemoteModTime}}{{end}}<span class="finder-source">&nbsp;{{if .LocalExists}}local{{end}}{{if and .LocalExists .RemoteExists}} + {{end}}{{if .RemoteExists}}remote{{end}}</span></div>
   <div class="finder-cell finder-actions">
-    {{if conflictFile .}}
-      <form class="sync-form" hx-post="/actions/path/upload?{{actionPath .Path "tree-row"}}" hx-target="#entry-{{.NodeID}}" hx-swap="outerHTML"><input type="hidden" name="path" value="{{.Path}}"><input type="hidden" name="return" value="tree-row"><button type="submit">Keep local</button></form>
-      <form class="sync-form" hx-post="/actions/path/download?{{actionPath .Path "tree-row"}}" hx-target="#entry-{{.NodeID}}" hx-swap="outerHTML"><input type="hidden" name="path" value="{{.Path}}"><input type="hidden" name="return" value="tree-row"><button type="submit">Keep remote</button></form>
-      {{if canMark .}}<form class="sync-form" hx-post="/actions/path/mark-synced?{{actionPath .Path "tree-row"}}" hx-target="#entry-{{.NodeID}}" hx-swap="outerHTML"><input type="hidden" name="path" value="{{.Path}}"><input type="hidden" name="return" value="tree-row"><button type="submit">Mark synced</button></form>{{end}}
-    {{end}}
-    {{if syncAction .}}<form class="sync-form" hx-post="/actions/path/{{syncAction .}}?{{actionPath .Path "tree-row"}}" hx-target="#entry-{{.NodeID}}" hx-swap="outerHTML"><input type="hidden" name="path" value="{{.Path}}"><input type="hidden" name="return" value="tree-row"><button type="submit">Sync</button></form>{{end}}
-    {{if deleteAction .}}<button class="danger" hx-get="/partials/confirm?action={{deleteAction .}}&path={{query .Path}}&return=tree-row" hx-target="#modal">Delete</button>{{end}}
-    {{if .LocalExists}}<form hx-post="/actions/path/open-local" hx-target="#noop" hx-swap="none"><input type="hidden" name="path" value="{{.Path}}"><button type="submit">Open</button></form>{{end}}
+    <details class="action-menu" onclick="event.stopPropagation()">
+      <summary aria-label="Actions for {{.Path}}" title="Actions">&#8942;</summary>
+      <div class="action-menu-list">
+        {{if conflictFile .}}
+          <form class="sync-form" hx-post="/actions/path/upload?{{actionPath .Path "tree-row"}}" hx-target="#entry-{{.NodeID}}" hx-swap="outerHTML"><input type="hidden" name="path" value="{{.Path}}"><input type="hidden" name="return" value="tree-row"><button type="submit">Keep local</button></form>
+          <form class="sync-form" hx-post="/actions/path/download?{{actionPath .Path "tree-row"}}" hx-target="#entry-{{.NodeID}}" hx-swap="outerHTML"><input type="hidden" name="path" value="{{.Path}}"><input type="hidden" name="return" value="tree-row"><button type="submit">Keep remote</button></form>
+          {{if canMark .}}<form class="sync-form" hx-post="/actions/path/mark-synced?{{actionPath .Path "tree-row"}}" hx-target="#entry-{{.NodeID}}" hx-swap="outerHTML"><input type="hidden" name="path" value="{{.Path}}"><input type="hidden" name="return" value="tree-row"><button type="submit">Mark synced</button></form>{{end}}
+        {{end}}
+        {{if syncAction .}}<form class="sync-form" hx-post="/actions/path/{{syncAction .}}?{{actionPath .Path "tree-row"}}" hx-target="#entry-{{.NodeID}}" hx-swap="outerHTML"><input type="hidden" name="path" value="{{.Path}}"><input type="hidden" name="return" value="tree-row"><button type="submit">Sync</button></form>{{end}}
+        {{if deleteAction .}}<button class="danger" hx-get="/partials/confirm?action={{deleteAction .}}&path={{query .Path}}&return=tree-row" hx-target="#modal">Delete</button>{{end}}
+        {{if .LocalExists}}<form hx-post="/actions/path/open-local" hx-target="#noop" hx-swap="none"><input type="hidden" name="path" value="{{.Path}}"><button type="submit">Open</button></form>{{end}}
+      </div>
+    </details>
   </div>
 </div>
 {{if .IsDir}}<div class="finder-child-slot" id="children-{{.NodeID}}"></div>{{end}}

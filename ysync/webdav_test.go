@@ -3,6 +3,7 @@ package ysync
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -60,6 +61,25 @@ func TestWebDAVGetRange(t *testing.T) {
 	_, _ = client.Get(context.Background(), "docs/a.txt", 42)
 	if got := lastRequest(requests).Header.Get("Range"); got != "bytes=42-" {
 		t.Fatalf("Range = %q", got)
+	}
+}
+
+func TestWebDAVPutSizedContentLength(t *testing.T) {
+	client, requests := testWebDAVClient(t)
+	_, _ = client.PutSized(context.Background(), "docs/a.txt", 42, strings.NewReader("hello"))
+	if got := lastRequest(requests).ContentLength; got != 42 {
+		t.Fatalf("ContentLength = %d, want 42", got)
+	}
+}
+
+func TestWebDAVMkcol(t *testing.T) {
+	client, requests := testWebDAVClient(t)
+	_, _ = client.Mkcol(context.Background(), "docs/audio")
+	if got := lastRequest(requests).Method; got != "MKCOL" {
+		t.Fatalf("method = %q, want MKCOL", got)
+	}
+	if got := lastRequest(requests).URL.Path; got != "/YSync/docs/audio" {
+		t.Fatalf("path = %q, want /YSync/docs/audio", got)
 	}
 }
 

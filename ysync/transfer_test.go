@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUploadUsesRemoteTempMoveAndUpdatesStateAfterRefresh(t *testing.T) {
@@ -78,6 +79,417 @@ func TestUploadUsesRemoteTempMoveAndUpdatesStateAfterRefresh(t *testing.T) {
 	entry := next.Entries["a.txt"]
 	if entry.Status != StatusSynced || entry.RemoteETag != "fresh" || entry.RemoteSize != 5 {
 		t.Fatalf("bad state entry: %#v", entry)
+	}
+}
+
+func TestUploadDirectoryCreatesRemoteDirectoryAndUpdatesState(t *testing.T) {
+	localRoot := t.TempDir()
+	dir := filepath.Join(localRoot, "audio")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, req.Method+" "+req.URL.Path)
+		switch req.Method {
+		case "PROPFIND":
+			if len(calls) == 1 {
+				return textResponse(http.StatusNotFound, "404 Not Found", ""), nil
+			}
+			body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/audio/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat></d:response>
+</d:multistatus>`
+			return xmlResponse(http.StatusMultiStatus, body), nil
+		case "MKCOL":
+			return textResponse(http.StatusCreated, "201 Created", ""), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+			return nil, nil
+		}
+	})}
+	client, err := NewWebDAVClient("https://example.test", "/YSync", "", "", httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{LocalRoot: localRoot, RemoteRoot: "/YSync"}
+	next, err := ExecutePlan(context.Background(), cfg, client, emptyState(), []PlanItem{{Action: ActionUpload, Path: "audio"}}, Logger{out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCalls := []string{
+		"PROPFIND /YSync/audio",
+		"MKCOL /YSync/audio",
+		"PROPFIND /YSync/audio",
+	}
+	if strings.Join(calls, "\n") != strings.Join(wantCalls, "\n") {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+	if entry := next.Entries["audio"]; entry.Status != StatusSynced || !entry.IsDir {
+		t.Fatalf("bad state entry: %#v", entry)
+	}
+}
+
+func TestUploadFileCreatesMissingRemoteParents(t *testing.T) {
+	localRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(localRoot, "audio/book"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localRoot, "audio/book/01.mp3"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, req.Method+" "+req.URL.Path)
+		switch req.Method {
+		case "PROPFIND":
+			switch req.URL.Path {
+			case "/YSync/audio/book/01.mp3":
+				if len(calls) == 1 {
+					return textResponse(http.StatusNotFound, "404 Not Found", ""), nil
+				}
+				body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/audio/book/01.mp3</d:href><d:propstat><d:prop><d:getcontentlength>5</d:getcontentlength><d:getetag>"fresh"</d:getetag></d:prop></d:propstat></d:response>
+</d:multistatus>`
+				return xmlResponse(http.StatusMultiStatus, body), nil
+			case "/YSync/audio", "/YSync/audio/book":
+				return textResponse(http.StatusNotFound, "404 Not Found", ""), nil
+			default:
+				t.Fatalf("unexpected PROPFIND path: %s", req.URL.Path)
+			}
+		case "MKCOL":
+			return textResponse(http.StatusCreated, "201 Created", ""), nil
+		case http.MethodPut:
+			return textResponse(http.StatusCreated, "201 Created", ""), nil
+		case "MOVE":
+			return textResponse(http.StatusCreated, "201 Created", ""), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+		return nil, nil
+	})}
+	client, err := NewWebDAVClient("https://example.test", "/YSync", "", "", httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{LocalRoot: localRoot, RemoteRoot: "/YSync"}
+	next, err := ExecutePlan(context.Background(), cfg, client, emptyState(), []PlanItem{{Action: ActionUpload, Path: "audio/book/01.mp3"}}, Logger{out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCalls := []string{
+		"PROPFIND /YSync/audio/book/01.mp3",
+		"PROPFIND /YSync/audio",
+		"MKCOL /YSync/audio",
+		"PROPFIND /YSync/audio/book",
+		"MKCOL /YSync/audio/book",
+		"PUT /YSync/audio/book/01.mp3.ysync-uploading",
+		"MOVE /YSync/audio/book/01.mp3.ysync-uploading",
+		"PROPFIND /YSync/audio/book/01.mp3",
+	}
+	if strings.Join(calls, "\n") != strings.Join(wantCalls, "\n") {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+	if entry := next.Entries["audio/book/01.mp3"]; entry.Status != StatusSynced {
+		t.Fatalf("bad state entry: %#v", entry)
+	}
+}
+
+func TestUploadContinuesWhenPutReturnsEOFButTempExists(t *testing.T) {
+	localRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(localRoot, "a.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, req.Method+" "+req.URL.Path)
+		switch req.Method {
+		case "PROPFIND":
+			switch req.URL.Path {
+			case "/YSync/a.txt":
+				if len(calls) == 1 {
+					return textResponse(http.StatusNotFound, "404 Not Found", ""), nil
+				}
+				body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/a.txt</d:href><d:propstat><d:prop><d:getcontentlength>5</d:getcontentlength><d:getetag>"fresh"</d:getetag></d:prop></d:propstat></d:response>
+</d:multistatus>`
+				return xmlResponse(http.StatusMultiStatus, body), nil
+			case "/YSync/a.txt.ysync-uploading":
+				body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/a.txt.ysync-uploading</d:href><d:propstat><d:prop><d:getcontentlength>5</d:getcontentlength><d:getetag>"temp"</d:getetag></d:prop></d:propstat></d:response>
+</d:multistatus>`
+				return xmlResponse(http.StatusMultiStatus, body), nil
+			default:
+				t.Fatalf("unexpected PROPFIND path: %s", req.URL.Path)
+			}
+		case http.MethodPut:
+			return nil, io.EOF
+		case "MOVE":
+			return textResponse(http.StatusCreated, "201 Created", ""), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+		return nil, nil
+	})}
+	client, err := NewWebDAVClient("https://example.test", "/YSync", "", "", httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{LocalRoot: localRoot, RemoteRoot: "/YSync"}
+	next, err := ExecutePlan(context.Background(), cfg, client, emptyState(), []PlanItem{{Action: ActionUpload, Path: "a.txt"}}, Logger{out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCalls := []string{
+		"PROPFIND /YSync/a.txt",
+		"PUT /YSync/a.txt.ysync-uploading",
+		"PROPFIND /YSync/a.txt.ysync-uploading",
+		"MOVE /YSync/a.txt.ysync-uploading",
+		"PROPFIND /YSync/a.txt",
+	}
+	if strings.Join(calls, "\n") != strings.Join(wantCalls, "\n") {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+	if entry := next.Entries["a.txt"]; entry.Status != StatusSynced {
+		t.Fatalf("bad state entry: %#v", entry)
+	}
+}
+
+func TestUploadRetriesPutWhenTempMissingAfterEOF(t *testing.T) {
+	localRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(localRoot, "a.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	putAttempts := 0
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, req.Method+" "+req.URL.Path)
+		switch req.Method {
+		case "PROPFIND":
+			switch req.URL.Path {
+			case "/YSync/a.txt":
+				if len(calls) == 1 {
+					return textResponse(http.StatusNotFound, "404 Not Found", ""), nil
+				}
+				body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/a.txt</d:href><d:propstat><d:prop><d:getcontentlength>5</d:getcontentlength><d:getetag>"fresh"</d:getetag></d:prop></d:propstat></d:response>
+</d:multistatus>`
+				return xmlResponse(http.StatusMultiStatus, body), nil
+			case "/YSync/a.txt.ysync-uploading":
+				return textResponse(http.StatusNotFound, "404 Not Found", ""), nil
+			default:
+				t.Fatalf("unexpected PROPFIND path: %s", req.URL.Path)
+			}
+		case http.MethodPut:
+			putAttempts++
+			if putAttempts == 1 {
+				return nil, io.EOF
+			}
+			return textResponse(http.StatusCreated, "201 Created", ""), nil
+		case "MOVE":
+			return textResponse(http.StatusCreated, "201 Created", ""), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+		return nil, nil
+	})}
+	client, err := NewWebDAVClient("https://example.test", "/YSync", "", "", httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{LocalRoot: localRoot, RemoteRoot: "/YSync"}
+	if _, err := ExecutePlan(context.Background(), cfg, client, emptyState(), []PlanItem{{Action: ActionUpload, Path: "a.txt"}}, Logger{out: io.Discard}); err != nil {
+		t.Fatal(err)
+	}
+	if putAttempts != 2 {
+		t.Fatalf("put attempts = %d, want 2", putAttempts)
+	}
+}
+
+func TestUploadVerifiesTempWhenPutResponseHangsAfterBodySent(t *testing.T) {
+	oldGrace := uploadResponseGrace
+	uploadResponseGrace = 10 * time.Millisecond
+	t.Cleanup(func() { uploadResponseGrace = oldGrace })
+
+	localRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(localRoot, "a.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, req.Method+" "+req.URL.Path)
+		switch req.Method {
+		case "PROPFIND":
+			switch req.URL.Path {
+			case "/YSync/a.txt":
+				if len(calls) == 1 {
+					return textResponse(http.StatusNotFound, "404 Not Found", ""), nil
+				}
+				body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/a.txt</d:href><d:propstat><d:prop><d:getcontentlength>5</d:getcontentlength><d:getetag>"fresh"</d:getetag></d:prop></d:propstat></d:response>
+</d:multistatus>`
+				return xmlResponse(http.StatusMultiStatus, body), nil
+			case "/YSync/a.txt.ysync-uploading":
+				body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/a.txt.ysync-uploading</d:href><d:propstat><d:prop><d:getcontentlength>5</d:getcontentlength><d:getetag>"temp"</d:getetag></d:prop></d:propstat></d:response>
+</d:multistatus>`
+				return xmlResponse(http.StatusMultiStatus, body), nil
+			default:
+				t.Fatalf("unexpected PROPFIND path: %s", req.URL.Path)
+			}
+		case http.MethodPut:
+			_, _ = io.Copy(io.Discard, req.Body)
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		case "MOVE":
+			return textResponse(http.StatusCreated, "201 Created", ""), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+		return nil, nil
+	})}
+	client, err := NewWebDAVClient("https://example.test", "/YSync", "", "", httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{LocalRoot: localRoot, RemoteRoot: "/YSync"}
+	next, err := ExecutePlan(context.Background(), cfg, client, emptyState(), []PlanItem{{Action: ActionUpload, Path: "a.txt"}}, Logger{out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCalls := []string{
+		"PROPFIND /YSync/a.txt",
+		"PUT /YSync/a.txt.ysync-uploading",
+		"PROPFIND /YSync/a.txt.ysync-uploading",
+		"MOVE /YSync/a.txt.ysync-uploading",
+		"PROPFIND /YSync/a.txt",
+	}
+	if strings.Join(calls, "\n") != strings.Join(wantCalls, "\n") {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+	if entry := next.Entries["a.txt"]; entry.Status != StatusSynced {
+		t.Fatalf("bad state entry: %#v", entry)
+	}
+}
+
+func TestUploadRetriesWhenResponseTimeoutLeavesNoTemp(t *testing.T) {
+	oldGrace := uploadResponseGrace
+	uploadResponseGrace = 10 * time.Millisecond
+	t.Cleanup(func() { uploadResponseGrace = oldGrace })
+
+	localRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(localRoot, "a.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	putAttempts := 0
+	tempChecks := 0
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.Method {
+		case "PROPFIND":
+			switch req.URL.Path {
+			case "/YSync/a.txt":
+				if putAttempts == 0 {
+					return textResponse(http.StatusNotFound, "404 Not Found", ""), nil
+				}
+				body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/a.txt</d:href><d:propstat><d:prop><d:getcontentlength>5</d:getcontentlength><d:getetag>"fresh"</d:getetag></d:prop></d:propstat></d:response>
+</d:multistatus>`
+				return xmlResponse(http.StatusMultiStatus, body), nil
+			case "/YSync/a.txt.ysync-uploading":
+				tempChecks++
+				return textResponse(http.StatusNotFound, "404 Not Found", ""), nil
+			default:
+				t.Fatalf("unexpected PROPFIND path: %s", req.URL.Path)
+			}
+		case http.MethodPut:
+			putAttempts++
+			if putAttempts == 1 {
+				_, _ = io.Copy(io.Discard, req.Body)
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			}
+			return textResponse(http.StatusCreated, "201 Created", ""), nil
+		case "MOVE":
+			return textResponse(http.StatusCreated, "201 Created", ""), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+		return nil, nil
+	})}
+	client, err := NewWebDAVClient("https://example.test", "/YSync", "", "", httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{LocalRoot: localRoot, RemoteRoot: "/YSync"}
+	next, err := ExecutePlan(context.Background(), cfg, client, emptyState(), []PlanItem{{Action: ActionUpload, Path: "a.txt"}}, Logger{out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if putAttempts != 2 {
+		t.Fatalf("put attempts = %d, want 2", putAttempts)
+	}
+	if tempChecks != 1 {
+		t.Fatalf("temp checks = %d, want 1", tempChecks)
+	}
+	if entry := next.Entries["a.txt"]; entry.Status != StatusSynced {
+		t.Fatalf("bad state entry: %#v", entry)
+	}
+}
+
+func TestExecutePlanDetailedContinuesAfterIndependentUploadFailure(t *testing.T) {
+	localRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(localRoot, "a.txt"), []byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localRoot, "b.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bPropfinds := 0
+	httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.Method {
+		case "PROPFIND":
+			switch req.URL.Path {
+			case "/YSync/a.txt":
+				body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/a.txt</d:href><d:propstat><d:prop><d:getcontentlength>9</d:getcontentlength><d:getetag>"remote"</d:getetag></d:prop></d:propstat></d:response>
+</d:multistatus>`
+				return xmlResponse(http.StatusMultiStatus, body), nil
+			case "/YSync/b.txt":
+				bPropfinds++
+				if bPropfinds == 1 {
+					return textResponse(http.StatusNotFound, "404 Not Found", ""), nil
+				}
+				body := `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+<d:response><d:href>/YSync/b.txt</d:href><d:propstat><d:prop><d:getcontentlength>5</d:getcontentlength><d:getetag>"fresh"</d:getetag></d:prop></d:propstat></d:response>
+</d:multistatus>`
+				return xmlResponse(http.StatusMultiStatus, body), nil
+			}
+		case http.MethodPut, "MOVE":
+			return textResponse(http.StatusCreated, "201 Created", ""), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+		return textResponse(http.StatusNotFound, "404 Not Found", ""), nil
+	})}
+	client, err := NewWebDAVClient("https://example.test", "/YSync", "", "", httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{LocalRoot: localRoot, RemoteRoot: "/YSync"}
+	state, executed, err := ExecutePlanDetailed(context.Background(), cfg, client, emptyState(), []PlanItem{
+		{Action: ActionUpload, Path: "a.txt"},
+		{Action: ActionUpload, Path: "b.txt"},
+	}, Logger{out: io.Discard})
+	if err == nil {
+		t.Fatal("expected aggregate error")
+	}
+	if len(executed) != 1 || executed[0].Path != "b.txt" {
+		t.Fatalf("executed = %#v, want only b.txt", executed)
+	}
+	if got := state.Entries["a.txt"].Status; got != StatusConflict {
+		t.Fatalf("a status = %q, want conflict", got)
+	}
+	if got := state.Entries["b.txt"].Status; got != StatusSynced {
+		t.Fatalf("b status = %q, want synced", got)
 	}
 }
 

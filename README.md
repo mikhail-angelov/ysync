@@ -1,211 +1,330 @@
-# ysync — Yandex Disk WebDAV Sync for macOS
+# ysync
 
-`ysync` synchronizes a local folder with Yandex Disk via the WebDAV API. It runs as a background LaunchAgent, watches filesystem changes with `fsnotify`, and safely syncs files with conflict detection.
+`ysync` is a macOS sync service for a local folder and Yandex Disk. It uses the Yandex Disk WebDAV API, watches local changes, syncs in the background, and provides a local web UI for reviewing plans, conflicts, and file status.
 
-## Quick Start
-
-```bash
-# Install
-git clone https://github.com/mikhail-angelov/ysync.git
-cd ysync
-go build -o ysync .
-
-# First run (dry-run mode — no changes made)
-ysync -local ~/SyncFolder -remote / --dry-run
-
-# Run service with web UI
-ysync -local ~/SyncFolder -remote /
-# UI at http://127.0.0.1:8787
-```
+It is designed to be local-scoped: by default, it syncs files that are present locally or already tracked in sync state. Remote-only files are ignored unless you explicitly import them.
 
 ## Requirements
 
-- macOS (uses `kqueue` for file watching, Keychain for credentials)
-- Yandex Disk with WebDAV enabled
-- Go 1.21+ (to build from source)
+- macOS
+- Go 1.21 or newer
+- Yandex Disk with WebDAV access
+- A Yandex app password or OAuth token
+
+## Install
+
+Clone and build:
+
+```bash
+git clone https://github.com/mikhail-angelov/ysync.git
+cd ysync
+make build
+```
+
+The binary is written to `bin/ysync`.
+
+You can keep install parameters in `.env`:
+
+```bash
+LOCAL_FOLDER=/Users/you/SyncFolder
+REMOTE_FOLDER=/
+YANDEX_USER=your@yandex.login
+YANDEX_PASS=your-app-password
+```
+
+`make` loads `.env` automatically. During `make install-macos`, `YANDEX_USER` and `YANDEX_PASS` or `YANDEX_TOKEN` are copied into the macOS Keychain profile `ysync`, and the LaunchAgent is configured to read that profile.
+
+Optional `.env` install settings include `URL`, `CONFLICT`, `DELETE_MODE`, `KEYCHAIN_PROFILE`, `INSTALL_DIR`, `LAUNCH_AGENT_LABEL`, `LAUNCH_AGENT_PLIST`, and `LOG_DIR`.
+
+Install it as a user LaunchAgent:
+
+```bash
+make install-macos LOCAL_FOLDER="$HOME/SyncFolder"
+```
+
+This installs `ysync` to `~/.local/bin/ysync`, writes a LaunchAgent plist to `~/Library/LaunchAgents/com.ysync.service.plist`, and starts the service for the current user.
+
+To sync a specific remote folder:
+
+```bash
+make install-macos LOCAL_FOLDER="$HOME/SyncFolder" REMOTE_FOLDER=/Documents
+```
+
+Extra runtime flags can be passed with `ARGS`:
+
+```bash
+make install-macos LOCAL_FOLDER="$HOME/SyncFolder" ARGS="-keychain-profile ysync -verbose"
+```
 
 ## Authentication
 
-Priority order (first available wins):
+`ysync` resolves credentials in this order:
 
-1. **macOS Keychain** — store `yandex_user` and `yandex_pass` in your default Keychain
-2. **Environment variables** — `YANDEX_USER` and `YANDEX_PASS`
-3. **CLI flags** — `--user` and `--pass`
+1. `-keychain-profile <name>` if provided
+2. explicit command-line values such as `-user`, `-pass`, or `-token`
+3. the default macOS Keychain profile named `ysync`
+4. environment variables for any values still missing
 
-## Usage
-
-```bash
-ysync -local ~/SyncFolder -remote / --user your@email.com --pass your-password
-```
-
-### Common options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-local` | required | Local folder to sync |
-| `-remote` | `/` | Remote Yandex Disk folder |
-| `-conflict` | `skip` | Conflict strategy: `skip`/`local`/`remote` |
-| `-delete` | `true` | Enable delete sync for tracked files |
-| `-delete-mode` | `trash` | Delete mode: `trash` (safe) or `hard` |
-| `-import-remote` | `false` | Import remote-only files |
-| `-init-strategy` | `skip-conflicts` | First-run strategy |
-| `-interval` | `5m` | Remote scan interval / cache TTL |
-| `-debounce` | `1m` | File debounce delay |
-| `-concurrency` | `3` | Max concurrent operations |
-| `-dry-run` | `false` | Print plan without making changes |
-| `-ui-addr` | `127.0.0.1:8787` | Web UI address |
-| `-verbose` | `false` | Enable debug logging |
-| `-log-file` | `""` | Write logs to file |
-
-### Examples
+Recommended Keychain setup:
 
 ```bash
-# Dry run to see what would happen
-ysync -local ~/Documents/ysync -remote /docs --dry-run
-
-# Run with verbose logging
-ysync -local ~/Documents/ysync -remote /docs --verbose
-
-# Force local files to win on conflicts
-ysync -local ~/Documents/ysync -remote /docs --conflict local
-
-# Delete remote files permanently (no trash)
-ysync -local ~/Documents/ysync -remote /docs --delete-mode hard
-
-# Download remote-only files
-ysync -local ~/Documents/ysync -remote /docs --import-remote
-
-# Override login credentials
-YANDEX_USER=user@yandex.com YANDEX_PASS=supersecret ysync -local ~/SyncFolder
+security add-generic-password -U -s ysync -a yandex_user -w "your@yandex.login"
+security add-generic-password -U -s ysync -a yandex_pass -w "your-app-password-or-token"
 ```
 
-### First sync strategies
+Environment variables are also supported:
 
-On first run, `ysync` has no previous sync state. Use `--init-strategy` to control behavior:
+```bash
+export YANDEX_USER="your@yandex.login"
+export YANDEX_PASS="your-app-password"
+```
+
+You can use `YANDEX_TOKEN` instead of `YANDEX_PASS`; internally it is used as the WebDAV password value.
+
+## First Run
+
+Before starting the background service, run a dry run to inspect the plan:
+
+```bash
+bin/ysync -local "$HOME/SyncFolder" -remote / --dry-run --verbose
+```
+
+If the local and remote folders already contain files, choose an initial sync strategy:
+
+```bash
+bin/ysync -local "$HOME/SyncFolder" -remote / --dry-run --init-strategy skip-conflicts
+bin/ysync -local "$HOME/SyncFolder" -remote / --dry-run --init-strategy newer-wins
+```
+
+Initial sync strategies:
 
 | Strategy | Behavior |
-|----------|----------|
-| `skip-conflicts` (default) | Upload new local files. Skip files that exist both locally and remotely with different metadata. |
-| `local-wins` | Upload local version for all conflicting files |
-| `remote-wins` | Download remote version for all conflicting files |
-| `newer-wins` | Use whichever file was modified more recently |
+| --- | --- |
+| `skip-conflicts` | Upload local-only files and skip files that already exist on both sides with different metadata. This is the default. |
+| `local-wins` | Upload the local version when both sides differ. |
+| `remote-wins` | Download the remote version when both sides differ. |
+| `newer-wins` | Use whichever file has the newer modification time. |
 
-Recommended: run `--dry-run` first to review the plan before committing.
+## Run Manually
+
+Run the service in the foreground:
 
 ```bash
-ysync -local ~/SyncFolder --dry-run
-ysync -local ~/SyncFolder --dry-run --init-strategy newer-wins
+bin/ysync -local "$HOME/SyncFolder" -remote /
+```
+
+Open the web UI:
+
+```text
+http://127.0.0.1:8787
+```
+
+Common manual commands:
+
+```bash
+# Inspect planned changes only
+bin/ysync -local "$HOME/SyncFolder" -remote / --dry-run
+
+# Sync a remote subfolder
+bin/ysync -local "$HOME/SyncFolder" -remote /Documents
+
+# Include remote-only files in the plan
+bin/ysync -local "$HOME/SyncFolder" -remote / --import-remote
+
+# Resolve conflicts by preferring local files
+bin/ysync -local "$HOME/SyncFolder" -remote / --conflict local
+```
+
+## LaunchAgent Management
+
+Start or restart the installed service:
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.ysync.service"
+```
+
+Stop the service:
+
+```bash
+launchctl bootout "gui/$(id -u)/com.ysync.service"
+```
+
+View logs:
+
+```bash
+tail -f "$HOME/Library/Logs/ysync/stdout.log"
+tail -f "$HOME/Library/Logs/ysync/stderr.log"
+```
+
+Regenerate the plist without installing:
+
+```bash
+bin/ysync -local "$HOME/SyncFolder" -remote / --print-launch-agent
 ```
 
 ## Web UI
 
-When the service is running, open [http://127.0.0.1:8787](http://127.0.0.1:8787) in your browser.
+The web UI runs locally at `http://127.0.0.1:8787` by default.
 
-### Tree view
-Browse your synced files and folders. Click folders to expand them.
+It provides:
 
-**Status icons:**
+- Dashboard with current sync status
+- Plan view for pending uploads, downloads, deletes, and conflicts
+- Conflicts view with per-file resolution actions
+- Tree view for local, remote, and tracked files
+- Operations log for the current service session
+- Settings page with the active configuration
 
-| Icon | Meaning |
-|------|---------|
-| ✓ | Synced (local = remote) |
-| ↑ | Pending upload or local-only |
-| ↓ | Pending download |
-| ⚠ | Conflict |
-| 🗑 | Pending delete / trash |
-| 👁 | Remote-only (ignored) |
-| ! | Error |
+Useful actions:
 
-**Actions per file:**
+| Action | Meaning |
+| --- | --- |
+| `Sync` | Download a remote-only file or run a pending operation. |
+| `Keep local` | Resolve a conflict by uploading the local version. |
+| `Keep remote` | Resolve a conflict by downloading the remote version. |
+| `Mark synced` | Mark matching local and remote files as synced. |
+| `Delete` | Trash or delete a tracked file, with confirmation. |
+| `Open` | Reveal the local file in Finder. |
 
-| Button | Description |
-|--------|-------------|
-| Sync | Download remote-only file |
-| Keep local / Keep remote | Resolve a conflict |
-| Mark synced | Mark as synced when sizes match |
-| Delete | Trash/delete (requires confirmation) |
-| Open | Reveal in Finder |
+## Sync Behavior
 
-### Operations tab
-Shows a log of all operations during the current session.
+`ysync` compares three things:
 
-### Settings tab
-Shows current configuration.
+- the last saved sync state
+- the current local folder
+- the current remote WebDAV tree
 
-### Filters
-Use the search bar to filter files by name. Toggle `Local only` or `Conflicts` checkboxes.
+This avoids treating every local/remote difference as a conflict on the first run.
 
-## How it works
+Default behavior:
 
-### Sync model
-`ysync` is **local-scoped** — it only syncs files that exist locally or were previously synced. Remote-only files are ignored by default (`--import-remote` to change this). This prevents downloading an entire Yandex Disk to a small disk.
+| Situation | Default action |
+| --- | --- |
+| New local file | Upload |
+| Remote-only untracked file | Ignore |
+| Local changed, remote unchanged | Upload |
+| Remote changed, local unchanged | Download |
+| Both changed | Conflict |
+| Local deleted, remote unchanged | Trash remote |
+| Remote deleted, local unchanged | Trash local |
 
-### Safety
-- **Temp files**: Uploads go to `.ysync-uploading` then renamed. Downloads go to `.ysync-downloading` then renamed. Partial files are never treated as complete.
-- **Point-refresh**: Before any destructive operation (upload, delete), a single-path PROPFIND verifies the remote hasn't changed.
-- **Atomic state saves**: State is written to `.tmp`, fsynced, then renamed.
-- **Conflict detection**: If both local and remote changed since last sync, the file is marked as conflict and left untouched.
-
-### Auto-sync
-When running in service mode, `ysync` watches local filesystem changes, debounces them (default: 1 minute), and automatically executes non-conflict plan items (upload, download, delete).
-
-### File ignoring
-Default ignored patterns: `.DS_Store`, `Thumbs.db`, `.git/`, `node_modules/`, `*.ysync.*`, `*.conflict-*`, and hidden files (files starting with `.`). Use `--include-hidden` to include hidden files, or `--ignore-file` for custom patterns.
-
-## Installation as LaunchAgent
-
-To run `ysync` as a background service:
+Deletes are enabled by default and use trash mode. To permanently delete instead:
 
 ```bash
-# Print the LaunchAgent plist
-ysync --print-launch-agent
+bin/ysync -local "$HOME/SyncFolder" -remote / --delete-mode hard
 ```
 
-Save the output to `~/Library/LaunchAgents/com.ysync.plist`, adjust paths, then:
+To disable delete propagation:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.ysync.plist
+bin/ysync -local "$HOME/SyncFolder" -remote / --delete=false
 ```
 
-## Project structure
+## Ignored Files
 
-```
-ysync/
-  main.go               — Entry point
-  ysync/
-    config.go           — CLI flag parsing
-    run.go              — Orchestrator
-    watcher.go          — File watcher with fallback polling
-    debounce.go         — File stability debouncer
-    ignore.go           — Ignore pattern matching
-    local.go            — Local file scanner
-    remote.go           — Remote tree loader
-    webdav.go           — WebDAV HTTP client
-    comparator.go       — Three-way comparison engine
-    transfer.go         — Upload/download/delete execution
-    state.go            — Sync state persistence
-    scheduler.go        — Concurrent job scheduler
-    cleanup.go          — Stale temp file cleanup
-    notify.go           — macOS notifications
-    ui.go               — Web UI server
-    remote_cache.go     — Remote tree cache
-    keychain.go         — macOS Keychain integration
-    launchagent.go      — LaunchAgent plist generation
-    log.go              — Structured logger
-    signal.go           — OS signal handling
-```
+By default, `ysync` ignores common system and project files, including:
 
-## Configuration reference
+- `.DS_Store`
+- `.git/`, `.svn/`, `.hg/`
+- `node_modules/`
+- `vendor/`
+- hidden files beginning with `.`
+- temporary sync files such as `*.ysync.*`
+- conflict files such as `*.conflict-*`
 
-### Environment variables
-
-| Variable | Description |
-|----------|-------------|
-| `YANDEX_USER` | Yandex login email |
-| `YANDEX_PASS` | Yandex password |
-
-### Keychain setup
+Include hidden files:
 
 ```bash
-security add-generic-password -s ysync -a yandex_user -w "your@email.com"
-security add-generic-password -s ysync -a yandex_pass -w "your-password"
+bin/ysync -local "$HOME/SyncFolder" -remote / --include-hidden
+```
+
+Use a custom ignore file:
+
+```bash
+bin/ysync -local "$HOME/SyncFolder" -remote / --ignore-file "$HOME/.ysyncignore"
+```
+
+## Options
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `-local` | required | Local folder to sync. |
+| `-remote` | `/` | Remote Yandex Disk folder. |
+| `-url` | `https://webdav.yandex.ru` | WebDAV base URL. |
+| `-user` | empty | Yandex login. |
+| `-pass` | empty | Yandex app password. |
+| `-token` | empty | Yandex OAuth token used as the password value. |
+| `-keychain-profile` | empty | Keychain service name to read credentials from. |
+| `-conflict` | `skip` | Conflict strategy: `skip`, `local`, or `remote`. |
+| `-delete` | `true` | Propagate deletes for tracked files. |
+| `-delete-mode` | `trash` | Delete mode: `trash` or `hard`. |
+| `-import-remote` | `false` | Include remote-only untracked files in the plan. |
+| `-init-strategy` | `skip-conflicts` | First-run strategy. |
+| `-interval` | `5m` | Remote scan interval and cache TTL. |
+| `-debounce` | `3s` | Delay before syncing a stable local file change. |
+| `-local-scan-interval` | `1m` | Polling interval if filesystem watching degrades. |
+| `-remote-workers` | `1` | Remote crawl worker count. |
+| `-concurrency` | `3` | Max concurrent sync operations. |
+| `-dry-run` | `false` | Print the plan without changing files. |
+| `-temp-ttl` | `24h` | Local temp file age before cleanup. |
+| `-remote-temp-ttl` | `24h` | Remote upload temp age before cleanup. |
+| `-show-cleanup` | `false` | Include cleanup actions in dry-run output. |
+| `-bandwidth` | `0` | Max bytes per second per transfer, where `0` means unlimited. |
+| `-ui-addr` | `127.0.0.1:8787` | Web UI listen address. |
+| `-log-file` | empty | Structured log file path. |
+| `-verbose` | `false` | Enable debug logging. |
+| `-state` | `~/.ysync/state.json` | Sync state file path. |
+| `-remote-cache` | `~/.ysync/remote-cache.json` | Remote metadata cache path. |
+| `-print-launch-agent` | `false` | Print a LaunchAgent plist and exit. |
+| `-version` | `false` | Print the version and exit. |
+
+## Files Created
+
+Default user files:
+
+| Path | Purpose |
+| --- | --- |
+| `~/.local/bin/ysync` | Installed binary from `make install-macos`. |
+| `~/Library/LaunchAgents/com.ysync.service.plist` | macOS LaunchAgent definition. |
+| `~/Library/Logs/ysync/stdout.log` | LaunchAgent standard output. |
+| `~/Library/Logs/ysync/stderr.log` | LaunchAgent standard error. |
+| `~/.ysync/state.json` | Sync state. |
+| `~/.ysync/remote-cache.json` | Remote metadata cache. |
+| `~/.ysync/trash/` | Local trash used by safe delete mode. |
+
+## Troubleshooting
+
+Check the planned changes before changing files:
+
+```bash
+bin/ysync -local "$HOME/SyncFolder" -remote / --dry-run --verbose
+```
+
+If authentication fails, confirm Keychain entries:
+
+```bash
+security find-generic-password -s ysync -a yandex_user -w
+security find-generic-password -s ysync -a yandex_pass -w
+```
+
+If the watcher reports too many open files, `ysync` falls back to polling. You can keep using the service, or increase macOS file limits if you need recursive event watching for a large tree.
+
+If the service will not start, inspect logs:
+
+```bash
+tail -n 100 "$HOME/Library/Logs/ysync/stderr.log"
+```
+
+## Development
+
+Useful commands:
+
+```bash
+make help
+make build
+make test
+make dry-run LOCAL_FOLDER="$HOME/SyncFolder"
+make run LOCAL_FOLDER="$HOME/SyncFolder"
+```
+
+The project is a Go module with the command entrypoint in `main.go` and implementation under `ysync/`.

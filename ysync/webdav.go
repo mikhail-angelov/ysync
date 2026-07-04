@@ -67,6 +67,23 @@ func (c *WebDAVClient) Put(ctx context.Context, relPath string, body io.Reader) 
 	return c.do(req, relPath)
 }
 
+func (c *WebDAVClient) PutSized(ctx context.Context, relPath string, size int64, body io.Reader) (*http.Response, error) {
+	req, err := c.newRequest(ctx, http.MethodPut, relPath, body)
+	if err != nil {
+		return nil, err
+	}
+	req.ContentLength = size
+	return c.do(req, relPath)
+}
+
+func (c *WebDAVClient) Mkcol(ctx context.Context, relPath string) (*http.Response, error) {
+	req, err := c.newRequest(ctx, "MKCOL", relPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.do(req, relPath)
+}
+
 func (c *WebDAVClient) Delete(ctx context.Context, relPath string) (*http.Response, error) {
 	req, err := c.newRequest(ctx, http.MethodDelete, relPath, nil)
 	if err != nil {
@@ -92,7 +109,7 @@ func (c *WebDAVClient) Move(ctx context.Context, fromRel, toRel string, overwrit
 func (c *WebDAVClient) do(req *http.Request, relPath string) (*http.Response, error) {
 	start := time.Now()
 	if c.Log.out != nil {
-		c.Log.Info("webdav request", "method", req.Method, "path", cleanRel(relPath), "depth", req.Header.Get("Depth"))
+		c.Log.Info("webdav request", "method", req.Method, "path", cleanRel(relPath), "depth", req.Header.Get("Depth"), "content_length", req.ContentLength)
 	}
 	resp, err := c.HTTP.Do(req)
 	if c.Log.out != nil {
