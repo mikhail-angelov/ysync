@@ -3,10 +3,9 @@ set -eu
 
 APP_NAME="ysync"
 LABEL="com.ysync.service"
-DEFAULT_REPO="mikhail-angelov/ysync"
+REPO="mikhail-angelov/ysync"
 
 SOURCE="github"
-REPO="$DEFAULT_REPO"
 VERSION="latest"
 BINARY_PATH=""
 INSTALL_DIR="${HOME}/.local/bin"
@@ -29,7 +28,6 @@ Install ysync as a per-user macOS LaunchAgent.
 
 Options:
   --source github|local       Install from GitHub release or local checkout (default: github)
-  --repo owner/name           GitHub repository for --source github (default: ${DEFAULT_REPO})
   --version vX.Y.Z|latest     GitHub release tag (default: latest)
   --binary path               Existing local binary to install
   --install-dir path          Binary install directory (default: ~/.local/bin)
@@ -48,9 +46,10 @@ Options:
 Environment:
   YANDEX_USER                 Yandex login to store in Keychain during install
   YANDEX_PASS                 Yandex app password to store in Keychain during install
-  YANDEX_TOKEN                OAuth token to store as the WebDAV password value
 
 Examples:
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh \\
+    | sh -s -- --local-folder ~/SyncFolder
   ./scripts/install.sh --source local --local-folder ~/SyncFolder
   ./scripts/install.sh --source github --version latest --local-folder ~/SyncFolder
   YANDEX_USER=you YANDEX_PASS=app-password ./scripts/install.sh --local-folder ~/SyncFolder
@@ -80,11 +79,6 @@ while [ "$#" -gt 0 ]; do
     --source)
       [ "$#" -ge 2 ] || die "--source requires a value"
       SOURCE="$2"
-      shift 2
-      ;;
-    --repo)
-      [ "$#" -ge 2 ] || die "--repo requires a value"
-      REPO="$2"
       shift 2
       ;;
     --version)
@@ -239,16 +233,21 @@ install_from_github() {
 
   archive="$TMP_DIR/$asset"
   echo "Downloading $url"
-  curl -fL "$url" -o "$archive"
+  if ! curl -fL "$url" -o "$archive"; then
+    die "failed to download ${asset}; publish a GitHub release for ${REPO}, choose another --version, or use --source local"
+  fi
   tar -xzf "$archive" -C "$TMP_DIR"
 
   extracted="$TMP_DIR/${APP_NAME}_Darwin_${arch}/${APP_NAME}"
-  [ -f "$extracted" ] || die "release archive does not contain ${APP_NAME}"
+  if [ ! -f "$extracted" ] && [ -f "$TMP_DIR/${APP_NAME}" ]; then
+    extracted="$TMP_DIR/${APP_NAME}"
+  fi
+  [ -f "$extracted" ] || die "release archive does not contain ${APP_NAME} at ${APP_NAME}_Darwin_${arch}/${APP_NAME}"
   install -m 0755 "$extracted" "$BIN_PATH"
 }
 
 install_keychain_credentials() {
-  if [ -z "${YANDEX_USER:-}" ] && [ -z "${YANDEX_PASS:-}" ] && [ -z "${YANDEX_TOKEN:-}" ]; then
+  if [ -z "${YANDEX_USER:-}" ] && [ -z "${YANDEX_PASS:-}" ]; then
     return
   fi
 
@@ -264,8 +263,6 @@ install_keychain_credentials() {
   fi
   if [ -n "${YANDEX_PASS:-}" ]; then
     security add-generic-password -U -s "$profile" -a yandex_pass -w "$YANDEX_PASS" >/dev/null
-  elif [ -n "${YANDEX_TOKEN:-}" ]; then
-    security add-generic-password -U -s "$profile" -a yandex_pass -w "$YANDEX_TOKEN" >/dev/null
   fi
 }
 

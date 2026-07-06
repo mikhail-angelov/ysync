@@ -17,7 +17,7 @@ ifneq ($(strip $(KEYCHAIN_PROFILE)),)
 YSYNC_AUTH_ARGS = -keychain-profile "$(KEYCHAIN_PROFILE)"
 endif
 YSYNC_ARGS = -local "$(LOCAL_FOLDER)" -remote "$(REMOTE_FOLDER)" -url "$(URL)" -conflict "$(CONFLICT)" -delete-mode "$(DELETE_MODE)" $(YSYNC_AUTH_ARGS) $(ARGS)
-ifneq ($(strip $(YANDEX_USER)$(YANDEX_PASS)$(YANDEX_TOKEN)),)
+ifneq ($(strip $(YANDEX_USER)$(YANDEX_PASS)),)
 ifeq ($(strip $(KEYCHAIN_PROFILE)),)
 INSTALL_AUTH_ARGS = -keychain-profile "$(INSTALL_KEYCHAIN_PROFILE)"
 endif
@@ -40,7 +40,7 @@ install-macos: build ## Install binary and LaunchAgent for the current macOS use
 	mkdir -p "$(INSTALL_DIR)" "$(dir $(LAUNCH_AGENT_PLIST))" "$(LOG_DIR)"
 	install -m 0755 "$(BIN)" "$(INSTALL_DIR)/$(APP)"
 	@if [ -n "$$YANDEX_USER" ]; then security add-generic-password -U -s "$(INSTALL_KEYCHAIN_PROFILE)" -a yandex_user -w "$$YANDEX_USER" >/dev/null; fi
-	@if [ -n "$$YANDEX_PASS" ]; then security add-generic-password -U -s "$(INSTALL_KEYCHAIN_PROFILE)" -a yandex_pass -w "$$YANDEX_PASS" >/dev/null; elif [ -n "$$YANDEX_TOKEN" ]; then security add-generic-password -U -s "$(INSTALL_KEYCHAIN_PROFILE)" -a yandex_pass -w "$$YANDEX_TOKEN" >/dev/null; fi
+	@if [ -n "$$YANDEX_PASS" ]; then security add-generic-password -U -s "$(INSTALL_KEYCHAIN_PROFILE)" -a yandex_pass -w "$$YANDEX_PASS" >/dev/null; fi
 	launchctl bootout "gui/$$(id -u)/$(LAUNCH_AGENT_LABEL)" 2>/dev/null || true
 	"$(INSTALL_DIR)/$(APP)" $(YSYNC_ARGS) $(INSTALL_AUTH_ARGS) --print-launch-agent > "$(LAUNCH_AGENT_PLIST)"
 	launchctl bootstrap "gui/$$(id -u)" "$(LAUNCH_AGENT_PLIST)"

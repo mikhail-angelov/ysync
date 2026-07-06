@@ -9,14 +9,15 @@ It is designed to be local-scoped: by default, it syncs files that are present l
 - macOS
 - Go 1.21 or newer
 - Yandex Disk with WebDAV access
-- A Yandex app password or OAuth token
+- A Yandex app password
 
 ## Install
 
 Install as a per-user macOS LaunchAgent from a GitHub release:
 
 ```bash
-./scripts/install.sh --local-folder "$HOME/SyncFolder"
+curl -fsSL https://raw.githubusercontent.com/mikhail-angelov/ysync/main/scripts/install.sh \
+  | sh -s -- --local-folder "$HOME/SyncFolder"
 ```
 
 To install from a local checkout instead:
@@ -33,15 +34,17 @@ Credentials can be imported into the macOS Keychain during install:
 
 ```bash
 YANDEX_USER="your@yandex.login" YANDEX_PASS="your-app-password" \
-  ./scripts/install.sh --local-folder "$HOME/SyncFolder"
+  sh -c "$(curl -fsSL https://raw.githubusercontent.com/mikhail-angelov/ysync/main/scripts/install.sh)" -- \
+    --local-folder "$HOME/SyncFolder"
 ```
 
-`YANDEX_TOKEN` can be used instead of `YANDEX_PASS`; internally it is stored as the WebDAV password value. When credentials are provided, the installer stores them under the `ysync` Keychain profile unless `--keychain-profile` is set.
+When credentials are provided, the installer stores them under the `ysync` Keychain profile unless `--keychain-profile` is set.
 
 To sync a specific remote folder:
 
 ```bash
-./scripts/install.sh --local-folder "$HOME/SyncFolder" --remote-folder /Documents
+curl -fsSL https://raw.githubusercontent.com/mikhail-angelov/ysync/main/scripts/install.sh \
+  | sh -s -- --local-folder "$HOME/SyncFolder" --remote-folder /Documents
 ```
 
 Use a specific release, local binary, or install location:
@@ -72,7 +75,7 @@ The development binary is written to `bin/ysync`.
 `ysync` resolves credentials in this order:
 
 1. `-keychain-profile <name>` if provided
-2. explicit command-line values such as `-user`, `-pass`, or `-token`
+2. explicit command-line values such as `-user` or `-pass`
 3. the default macOS Keychain profile named `ysync`
 4. environment variables for any values still missing
 
@@ -80,7 +83,7 @@ Recommended Keychain setup:
 
 ```bash
 security add-generic-password -U -s ysync -a yandex_user -w "your@yandex.login"
-security add-generic-password -U -s ysync -a yandex_pass -w "your-app-password-or-token"
+security add-generic-password -U -s ysync -a yandex_pass -w "your-app-password"
 ```
 
 Environment variables are also supported:
@@ -89,8 +92,6 @@ Environment variables are also supported:
 export YANDEX_USER="your@yandex.login"
 export YANDEX_PASS="your-app-password"
 ```
-
-You can use `YANDEX_TOKEN` instead of `YANDEX_PASS`; internally it is used as the WebDAV password value.
 
 ## First Run
 
@@ -339,3 +340,14 @@ make run LOCAL_FOLDER="$HOME/SyncFolder"
 ```
 
 The project is a Go module with the command entrypoint in `main.go` and implementation under `ysync/`.
+
+## Release
+
+GitHub Actions publishes releases for version tags:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow runs tests, builds Darwin and Linux archives for `amd64` and `arm64`, uploads checksums, and names macOS assets in the format expected by `scripts/install.sh`, such as `ysync_Darwin_arm64.tar.gz`.
