@@ -13,48 +13,59 @@ It is designed to be local-scoped: by default, it syncs files that are present l
 
 ## Install
 
-Clone and build:
+Install as a per-user macOS LaunchAgent from a GitHub release:
+
+```bash
+./scripts/install.sh --local-folder "$HOME/SyncFolder"
+```
+
+To install from a local checkout instead:
 
 ```bash
 git clone https://github.com/mikhail-angelov/ysync.git
 cd ysync
-make build
+./scripts/install.sh --source local --local-folder "$HOME/SyncFolder"
 ```
 
-The binary is written to `bin/ysync`.
+The installer writes `ysync` to `~/.local/bin/ysync`, writes the LaunchAgent plist to `~/Library/LaunchAgents/com.ysync.service.plist`, and starts the service for the current user.
 
-You can keep install parameters in `.env`:
+Credentials can be imported into the macOS Keychain during install:
 
 ```bash
-LOCAL_FOLDER=/Users/you/SyncFolder
-REMOTE_FOLDER=/
-YANDEX_USER=your@yandex.login
-YANDEX_PASS=your-app-password
+YANDEX_USER="your@yandex.login" YANDEX_PASS="your-app-password" \
+  ./scripts/install.sh --local-folder "$HOME/SyncFolder"
 ```
 
-`make` loads `.env` automatically. During `make install-macos`, `YANDEX_USER` and `YANDEX_PASS` or `YANDEX_TOKEN` are copied into the macOS Keychain profile `ysync`, and the LaunchAgent is configured to read that profile.
-
-Optional `.env` install settings include `URL`, `CONFLICT`, `DELETE_MODE`, `KEYCHAIN_PROFILE`, `INSTALL_DIR`, `LAUNCH_AGENT_LABEL`, `LAUNCH_AGENT_PLIST`, and `LOG_DIR`.
-
-Install it as a user LaunchAgent:
-
-```bash
-make install-macos LOCAL_FOLDER="$HOME/SyncFolder"
-```
-
-This installs `ysync` to `~/.local/bin/ysync`, writes a LaunchAgent plist to `~/Library/LaunchAgents/com.ysync.service.plist`, and starts the service for the current user.
+`YANDEX_TOKEN` can be used instead of `YANDEX_PASS`; internally it is stored as the WebDAV password value. When credentials are provided, the installer stores them under the `ysync` Keychain profile unless `--keychain-profile` is set.
 
 To sync a specific remote folder:
 
 ```bash
-make install-macos LOCAL_FOLDER="$HOME/SyncFolder" REMOTE_FOLDER=/Documents
+./scripts/install.sh --local-folder "$HOME/SyncFolder" --remote-folder /Documents
 ```
 
-Extra runtime flags can be passed with `ARGS`:
+Use a specific release, local binary, or install location:
 
 ```bash
-make install-macos LOCAL_FOLDER="$HOME/SyncFolder" ARGS="-keychain-profile ysync -verbose"
+./scripts/install.sh --version v0.1.0 --local-folder "$HOME/SyncFolder"
+./scripts/install.sh --source local --binary ./bin/ysync --local-folder "$HOME/SyncFolder"
+./scripts/install.sh --install-dir "$HOME/bin" --local-folder "$HOME/SyncFolder"
 ```
+
+Uninstall the LaunchAgent:
+
+```bash
+./scripts/install.sh --uninstall
+./scripts/install.sh --uninstall --remove-binary
+```
+
+For development, you can still build with `make`:
+
+```bash
+make build
+```
+
+The development binary is written to `bin/ysync`.
 
 ## Authentication
 

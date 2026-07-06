@@ -12,6 +12,7 @@ func TestGenerateLaunchAgentPlistEscapesArgumentsAndOmitsSecrets(t *testing.T) {
 		BaseURL:          `https://webdav.yandex.ru`,
 		ConflictStrategy: `skip`,
 		DeleteMode:       `trash`,
+		UIAddr:           `127.0.0.1:8788`,
 		KeychainProfile:  `ysync`,
 		User:             `secret-user`,
 		Pass:             `secret-pass`,
@@ -21,6 +22,7 @@ func TestGenerateLaunchAgentPlistEscapesArgumentsAndOmitsSecrets(t *testing.T) {
 		"<key>Label</key>",
 		"<string>com.ysync.service</string>",
 		"<string>/Users/me/Sync &amp; Stuff</string>",
+		"<string>127.0.0.1:8788</string>",
 		"<string>-keychain-profile</string>",
 	} {
 		if !strings.Contains(plist, want) {

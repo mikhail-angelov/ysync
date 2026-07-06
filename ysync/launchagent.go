@@ -19,6 +19,7 @@ func GenerateLaunchAgentPlist(cfg Config, executable string) string {
 		"-url", cfg.BaseURL,
 		"-conflict", cfg.ConflictStrategy,
 		"-delete-mode", cfg.DeleteMode,
+		"-ui-addr", cfg.UIAddr,
 	}
 	if cfg.KeychainProfile != "" {
 		args = append(args, "-keychain-profile", cfg.KeychainProfile)
