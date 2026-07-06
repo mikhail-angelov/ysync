@@ -4,6 +4,9 @@
 
 It is designed to be local-scoped: by default, it syncs files that are present locally or already tracked in sync state. Remote-only files are ignored unless you explicitly import them.
 
+<img width="600" alt="screen" src="https://github.com/user-attachments/assets/f4ec5e6f-1c8d-47b7-bf39-b21f731ca28d" />
+
+
 ## Requirements
 
 - macOS
